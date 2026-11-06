@@ -69,6 +69,7 @@ LIMITE_LEGENDA_FOTO = 1024   # limite do Telegram para legenda de foto
 TAMANHO_RESUMO = 280
 USER_AGENT = "alerta-promocoes-bot/1.1"
 FUSO_BR = timezone(timedelta(hours=-3))
+VERSAO_ESTADO = 2            # mude quando os critérios de busca mudarem
 
 
 def env_int(nome, padrao):
@@ -84,6 +85,7 @@ def env_bool(nome, padrao):
 
 
 DESCONTO_MINIMO = env_int("DESCONTO_MINIMO", 75)
+HIST_DESCONTO_MINIMO = env_int("HIST_DESCONTO_MINIMO", 30)  # menor histórico só conta a partir daqui
 NOTA_MINIMA = env_int("NOTA_MINIMA", 70)
 MIN_AVALIACOES = env_int("MIN_AVALIACOES", 300)
 MAX_DETALHADOS = env_int("MAX_DETALHADOS", 10)
@@ -211,7 +213,8 @@ def converter_item_itad(item):
     desconto = deal.get("cut") or 0
     gratis = valor == 0
     # Menor histórico: confirmamos pelo número, não só pela "flag" da API.
-    menor_hist = hist.get("amount") is not None and valor <= hist["amount"] and desconto > 0
+    menor_hist = (hist.get("amount") is not None and valor <= hist["amount"]
+                  and desconto >= HIST_DESCONTO_MINIMO)
     # Trava de segurança: mesmo que a API ignore o filtro, só passa o que interessa.
     if not (gratis or menor_hist or desconto >= DESCONTO_MINIMO):
         return None
@@ -228,6 +231,8 @@ def converter_item_itad(item):
         "gratis": gratis,
         "menor_hist": menor_hist,
         "expira": deal.get("expiry"),
+        # "timestamp" é quando a loja passou a cobrar este preço, ou seja, o início da promoção.
+        "inicio": deal.get("timestamp"),
         "url": deal.get("url") or f"https://isthereanydeal.com/game/{item.get('slug', '')}/info/",
         "id_jogo": item.get("id") or normalizar_titulo(item.get("title")),
         "id_itad": item.get("id"),
@@ -249,13 +254,13 @@ def buscar_gratis_epic():
     resultado = []
     for el in elementos:
         promos = (el.get("promotions") or {}).get("promotionalOffers") or []
-        fim_gratis = None
+        fim_gratis = inicio_gratis = None
         for grupo in promos:
             for oferta in grupo.get("promotionalOffers") or []:
                 desc = (oferta.get("discountSetting") or {}).get("discountPercentage")
                 inicio, fim = oferta.get("startDate"), oferta.get("endDate")
                 if desc == 0 and inicio and fim and _iso(inicio) <= agora < _iso(fim):
-                    fim_gratis = fim
+                    inicio_gratis, fim_gratis = inicio, fim
         total = (el.get("price") or {}).get("totalPrice") or {}
         if not fim_gratis or total.get("discountPrice") not in (0, None):
             continue
@@ -276,6 +281,7 @@ def buscar_gratis_epic():
             "gratis": True,
             "menor_hist": False,
             "expira": fim_gratis,
+            "inicio": inicio_gratis,
             "url": f"https://store.epicgames.com/pt-BR/p/{slug}" if slug
                    else "https://store.epicgames.com/pt-BR/free-games",
             "id_jogo": normalizar_titulo(el.get("title")),
@@ -368,11 +374,16 @@ def chave_oferta(o):
 
 def carregar_estado():
     if not os.path.exists(ARQUIVO_ESTADO):
-        return {"inicializado": False, "enviados": {}}
+        return {"inicializado": False, "enviados": {}, "versao": VERSAO_ESTADO}
     with open(ARQUIVO_ESTADO, encoding="utf-8") as f:
         estado = json.load(f)
     estado.setdefault("inicializado", True)
     estado.setdefault("enviados", {})
+    if estado.get("versao") != VERSAO_ESTADO:
+        # Os critérios de busca mudaram: registra de novo as ofertas atuais em silêncio,
+        # para a atualização não disparar centenas de avisos de uma vez.
+        estado["inicializado"] = False
+        estado["versao"] = VERSAO_ESTADO
     return estado
 
 
@@ -446,6 +457,35 @@ def formatar_prazo(o):
         return ""
 
 
+MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+SEPARADOR = "━━━━━━━━━━━━━━━━"
+
+
+def data_curta(texto_iso):
+    """'2026-12-17T15:00:00Z' -> '17 dez' (no horário de Brasília)."""
+    try:
+        d = _iso(texto_iso).astimezone(FUSO_BR)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return f"{d.day:02d} {MESES[d.month - 1]}"
+
+
+def tempo_restante(texto_iso, agora=None):
+    """Contagem regressiva legível: 'termina hoje', 'termina em 3 dias'..."""
+    try:
+        fim = _iso(texto_iso)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    agora = agora or datetime.now(timezone.utc)
+    horas = (fim - agora).total_seconds() / 3600
+    if horas <= 0:
+        return None
+    if horas < 24:
+        return f"⚠️ termina em {max(1, int(horas))}h"
+    dias = max(1, round(horas / 24))
+    return "⏳ termina amanhã" if dias == 1 else f"⏳ termina em {dias} dias"
+
+
 def montar_legenda(o):
     if o["gratis"]:
         selo = "🎁 <b>GRÁTIS PARA RESGATAR</b>"
@@ -454,38 +494,55 @@ def montar_legenda(o):
     else:
         selo = f"🔥 <b>{o['desconto']}% DE DESCONTO</b>"
 
-    linhas = [selo, f"<b>{html.escape(o['titulo'])}</b>", ""]
+    # Bloco 1: identificação
+    linhas = [selo, SEPARADOR, f"🎮 <b>{html.escape(o['titulo'])}</b>"]
+    if o.get("tags"):
+        linhas.append("🏷 <i>" + html.escape(" · ".join(o["tags"])) + "</i>")
+
+    # Bloco 2: preço
+    linhas.append("")
     if o["gratis"]:
         preco = "💰 <b>R$ 0,00</b>"
         if o.get("regular"):
-            preco += f" (custa {formatar_preco(o['regular'], o['moeda'])})"
+            preco += f"   <s>{formatar_preco(o['regular'], o['moeda'])}</s>"
+        linhas.append(preco)
     else:
-        preco = (f"💰 <b>{formatar_preco(o['preco'], o['moeda'])}</b>"
-                 f" (era <s>{formatar_preco(o['regular'], o['moeda'])}</s>)")
-    linhas.append(preco)
-    if not o["gratis"] and o.get("regular"):
-        economia = o["regular"] - o["preco"]
-        linhas.append(f"📉 Baixou <b>{formatar_preco(economia, o['moeda'])}</b> (-{o['desconto']}%)")
+        linhas.append(f"💰 <b>{formatar_preco(o['preco'], o['moeda'])}</b>"
+                      f"   <s>{formatar_preco(o['regular'], o['moeda'])}</s>")
+        if o.get("regular"):
+            economia = o["regular"] - o["preco"]
+            linhas.append(f"📉 <b>−{o['desconto']}%</b> · economia de <b>{formatar_preco(economia, o['moeda'])}</b>")
 
-    loja = f"🏪 {html.escape(o['loja'])}"
-    prazo = formatar_prazo(o)
-    linhas.append(f"{loja} · ⏰ {prazo}" if prazo else loja)
+    # Bloco 3: período da promoção
+    linhas.append("")
+    inicio, fim = data_curta(o.get("inicio")), data_curta(o.get("expira"))
+    if inicio and fim:
+        linhas.append(f"📅 <b>Promoção:</b> {inicio} → {fim}")
+    elif fim:
+        linhas.append(f"📅 <b>Promoção até:</b> {fim}")
+    elif inicio:
+        linhas.append(f"📅 <b>Promoção desde:</b> {inicio} (sem data de fim divulgada)")
+    restante = tempo_restante(o.get("expira"))
+    if restante:
+        linhas.append(restante)
 
-    extras = []
+    # Bloco 4: loja e avaliação
+    detalhes = [f"🏪 {html.escape(o['loja'])}"]
     if o.get("nota") is not None:
         n = o.get("n_avaliacoes")
-        qtd = f" de {n:,}".replace(",", ".") + " avaliações" if n else ""
-        extras.append(f"⭐ {o['nota']}% positivas{qtd}")
-    if o.get("tags"):
-        extras.append("🏷 " + html.escape(", ".join(o["tags"])))
-    linhas += extras
+        qtd = f" ({n:,})".replace(",", ".") if n else ""
+        detalhes.append(f"⭐ {o['nota']}% positivas{qtd}")
+    linhas.append(" · ".join(detalhes))
 
     texto = "\n".join(linhas)
+
+    # Bloco 5: resumo, numa citação que se expande ao tocar
     if o.get("resumo"):
-        espaco = LIMITE_LEGENDA_FOTO - len(texto) - 20
+        moldura = len("\n\n<blockquote expandable></blockquote>") + len(SEPARADOR) + 1
+        espaco = LIMITE_LEGENDA_FOTO - len(texto) - moldura - 10
         resumo = limpar_texto(o["resumo"], max(0, min(TAMANHO_RESUMO, espaco)))
         if resumo:
-            texto += f"\n\n<i>{html.escape(resumo)}</i>"
+            texto += f"\n{SEPARADOR}\n<blockquote expandable>{html.escape(resumo)}</blockquote>"
     return texto
 
 
@@ -558,7 +615,7 @@ def coletar_ofertas(chave_itad):
             f"desconto >= {DESCONTO_MINIMO}%")
         try:
             brutos += buscar_ofertas_itad(
-                chave_itad, ids, {"flag": "H", "cut": faixa(1, 99), **filtro_qualidade()},
+                chave_itad, ids, {"flag": "H", "cut": faixa(HIST_DESCONTO_MINIMO, 99), **filtro_qualidade()},
                 "menor preço histórico")
         except RuntimeError as e:
             falhas.append(f"filtro de menor histórico: {e}")
@@ -619,10 +676,11 @@ def main():
     if not estado["inicializado"]:
         # Primeira execução: registra o que já está em promoção sem mandar tudo de uma vez.
         gratis = [o for o in novas.values() if o["gratis"]]
+        titulo = "atualizado" if estado["enviados"] else "ativado"
         enviar_mensagens(token, chat_id, [
-            "🤖 <b>Bot de promoções ativado!</b>\n"
-            f"Já havia {len(novas)} ofertas ativas; registrei todas para não lotar seu chat. "
-            "A partir de agora você só recebe as novas."])
+            f"🤖 <b>Bot de promoções {titulo}!</b>\n"
+            f"Há {len(unicas)} ofertas ativas que se encaixam nos seus critérios; registrei todas "
+            "para não lotar seu chat. A partir de agora você só recebe as novas."])
         if gratis:
             time.sleep(1.2)
             enviar_ofertas(token, chat_id, gratis, chave_itad)
