@@ -7,6 +7,11 @@ on:
     # é quando o GitHub fica mais congestionado e as execuções atrasam.
     - cron: "17 */3 * * *"
   workflow_dispatch:   # permite rodar manualmente pelo botão "Run workflow"
+    inputs:
+      exemplo:
+        description: "Só mandar 3 ofertas atuais como exemplo (não altera nada)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write      # necessário para gravar o estado.json de volta no repositório
@@ -36,6 +41,10 @@ jobs:
           # Opcionais: crie em Settings > Secrets and variables > Actions > aba "Variables"
           DESCONTO_MINIMO: ${{ vars.DESCONTO_MINIMO }}
           INCLUIR_DLC: ${{ vars.INCLUIR_DLC }}
+          NOTA_MINIMA: ${{ vars.NOTA_MINIMA }}
+          MIN_AVALIACOES: ${{ vars.MIN_AVALIACOES }}
+          MAX_DETALHADOS: ${{ vars.MAX_DETALHADOS }}
+          MODO_EXEMPLO: ${{ inputs.exemplo }}
         run: python bot.py
 
       - name: Salvar ofertas já avisadas
