@@ -1,0 +1,16 @@
+# Teste manual de conexão com as lojas de console. Não usa chaves nem manda mensagens.
+name: Teste de conexão (consoles)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  testar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python sondagem.py
