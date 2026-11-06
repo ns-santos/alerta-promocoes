@@ -69,7 +69,16 @@ LIMITE_LEGENDA_FOTO = 1024   # limite do Telegram para legenda de foto
 TAMANHO_RESUMO = 280
 USER_AGENT = "alerta-promocoes-bot/1.1"
 FUSO_BR = timezone(timedelta(hours=-3))
-VERSAO_ESTADO = 2            # mude quando os critérios de busca mudarem
+VERSAO_ESTADO = 3            # mude quando os critérios de busca mudarem
+
+PS_GRAPHQL = "https://web.np.playstation.com/api/graphql/v1/op"
+PS_CATEGORIA_PS5 = "4cbf39e2-5749-4970-ba81-93a489e4570c"   # "Todos os jogos de PS5" (inclui PS4 compatíveis)
+PS_HASH_GRADE = "9845afc0dbaab4965f6563fffc703f588c8e76792000e8610843b8d3ee9c4c09"
+XBOX_BROWSE = "https://emerald.xboxservices.com/xboxcomfd/browse?locale=pt-BR"
+NAVEGADOR = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/141.0 Safari/537.36")
+# Texto que a PS Store mostra quando o jogo está no catálogo de um plano do PS Plus.
+PLANOS_PS = {"essential": 1, "extra": 2, "deluxe": 3, "premium": 3}
 
 
 def env_int(nome, padrao):
@@ -93,13 +102,24 @@ INCLUIR_DLC = env_bool("INCLUIR_DLC", False)
 MAX_PAGINAS = env_int("MAX_PAGINAS", 5)
 MODO_EXEMPLO = env_bool("MODO_EXEMPLO", False)
 
+# Consoles: descontos costumam ser menores que no PC, então o mínimo padrão é 50%.
+DESCONTO_MINIMO_CONSOLE = env_int("DESCONTO_MINIMO_CONSOLE", 50)
+INCLUIR_PLAYSTATION = env_bool("INCLUIR_PLAYSTATION", True)
+INCLUIR_XBOX = env_bool("INCLUIR_XBOX", True)
+# PlayStation: só os N jogos mais vendidos do mês (filtro de popularidade, já que a lista não traz nota).
+PS_MAX_JOGOS = env_int("PS_MAX_JOGOS", 2000)
+PS_ASSINATURA = os.environ.get("PS_ASSINATURA", "").strip() or "Deluxe"  # Essential, Extra ou Deluxe
+XBOX_NOTA_MINIMA = float(os.environ.get("XBOX_NOTA_MINIMA", "").strip() or 3.5)   # de 0 a 5
+XBOX_MIN_AVALIACOES = env_int("XBOX_MIN_AVALIACOES", 20)
+XBOX_MAX_PAGINAS = env_int("XBOX_MAX_PAGINAS", 70)  # 25 jogos por página
+
 
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
-def requisicao(url, metodo="GET", corpo=None, cabecalhos=None, tentativas=3):
-    """Faz uma requisição HTTP e devolve o JSON. Tenta de novo em erros temporários."""
+def requisicao(url, metodo="GET", corpo=None, cabecalhos=None, tentativas=3, texto=False):
+    """Faz uma requisição HTTP e devolve o JSON (ou o texto). Tenta de novo em erros temporários."""
     cab = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if cabecalhos:
         cab.update(cabecalhos)
@@ -112,7 +132,8 @@ def requisicao(url, metodo="GET", corpo=None, cabecalhos=None, tentativas=3):
         req = urllib.request.Request(url, data=dados, headers=cab, method=metodo)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                bruto = resp.read().decode("utf-8", errors="replace")
+                return bruto if texto else json.loads(bruto)
         except urllib.error.HTTPError as e:
             # 429 = muitas requisições; 5xx = erro do servidor. Vale esperar e tentar de novo.
             if e.code == 429 or 500 <= e.code < 600:
@@ -317,6 +338,192 @@ def _imagem_epic(el):
 
 
 # ---------------------------------------------------------------------------
+# PlayStation Store (API interna do site; não é oficial e pode mudar)
+# ---------------------------------------------------------------------------
+
+def preco_brl(texto):
+    """'R$1.234,56' -> 1234.56; 'Gratuito'/'Grátis' -> 0.0; desconhecido -> None."""
+    if not texto:
+        return None
+    if re.search(r"gr[aá]t", texto, re.I):
+        return 0.0
+    numeros = re.sub(r"[^\d,]", "", texto).replace(",", ".")
+    try:
+        return float(numeros)
+    except ValueError:
+        return None
+
+
+def incluso_no_plano(upsell):
+    """'Extra'/'Deluxe'/'Incluído' -> o jogo faz parte do catálogo do PS Plus que a pessoa assina?"""
+    texto = (upsell or "").strip().lower()
+    if texto in ("incluído", "incluido", "included"):
+        return True
+    nivel = PLANOS_PS.get(texto)
+    return nivel is not None and nivel <= PLANOS_PS.get(PS_ASSINATURA.lower(), 3)
+
+
+def converter_item_ps(p):
+    preco = p.get("price") or {}
+    if not preco:
+        return None
+    base, atual = preco_brl(preco.get("basePrice")), preco_brl(preco.get("discountedPrice"))
+    if base is None or atual is None:
+        return None
+    m = re.search(r"(\d+)\s*%", preco.get("discountText") or "")
+    desconto = int(m.group(1)) if m else 0
+    upsell = preco.get("upsellText") or ""
+    incluso = incluso_no_plano(upsell)
+    extra_plus = re.search(r"mais\s+(\d+)\s*%", upsell, re.I)
+    gratis = (preco.get("isFree") or atual == 0) and base > 0
+    if not (incluso or gratis or desconto >= DESCONTO_MINIMO_CONSOLE):
+        return None
+
+    midias = {md.get("role"): md.get("url") for md in p.get("media") or [] if md.get("type") == "IMAGE"}
+    imagem = next((midias[r] for r in ("FOUR_BY_THREE_BANNER", "MASTER", "GAMEHUB_COVER_ART", "BACKGROUND")
+                   if midias.get(r)), None)
+    return {
+        "titulo": p.get("name") or "?",
+        "loja": "PlayStation Store",
+        "plataformas": [x for x in (p.get("platforms") or []) if x],
+        "preco": 0.0 if incluso else atual,
+        "preco_int": 0 if incluso else int(round(atual * 100)),
+        "regular": base,
+        "moeda": "BRL",
+        "desconto": 100 if incluso else desconto,
+        "gratis": bool(gratis) and not incluso,
+        "incluso": incluso,
+        "menor_hist": False,
+        "so_assinante": bool(preco.get("isTiedToSubscription")),
+        "extra_plus": int(extra_plus.group(1)) if extra_plus else None,
+        "expira": None,
+        "inicio": None,
+        "url": f"https://store.playstation.com/pt-br/product/{p.get('id')}",
+        "id_jogo": "ps:" + (p.get("id") or normalizar_titulo(p.get("name"))),
+        "id_ps": p.get("id"),
+        "imagem": imagem,
+        "resumo": None,
+    }
+
+
+def buscar_playstation():
+    ofertas, offset = [], 0
+    while offset < PS_MAX_JOGOS:
+        variaveis = {"id": PS_CATEGORIA_PS5, "pageArgs": {"size": min(1000, PS_MAX_JOGOS - offset), "offset": offset},
+                     "sortBy": {"name": "sales30", "isAscending": False}, "filterBy": [], "facetOptions": []}
+        extensoes = {"persistedQuery": {"version": 1, "sha256Hash": PS_HASH_GRADE}}
+        url = (f"{PS_GRAPHQL}?operationName=categoryGridRetrieve"
+               f"&variables={urllib.parse.quote(json.dumps(variaveis))}"
+               f"&extensions={urllib.parse.quote(json.dumps(extensoes))}")
+        dados = requisicao(url, cabecalhos={"x-psn-store-locale-override": "pt-BR", "User-Agent": NAVEGADOR})
+        if dados.get("errors"):
+            raise RuntimeError(f"PS Store recusou a consulta: {str(dados['errors'])[:200]}")
+        grade = (dados.get("data") or {}).get("categoryGridRetrieve") or {}
+        produtos = grade.get("products") or []
+        ofertas += [o for o in map(converter_item_ps, produtos) if o]
+        info = grade.get("pageInfo") or {}
+        offset += len(produtos)
+        if info.get("isLast") or not produtos:
+            break
+    inclusos = sum(1 for o in ofertas if o["incluso"])
+    print(f"[info] PlayStation: {len(ofertas) - inclusos} ofertas e {inclusos} jogos inclusos no PS Plus {PS_ASSINATURA}.")
+    return ofertas
+
+
+def enriquecer_ps(o):
+    """A página do produto traz o fim da promoção, a descrição em português e a nota."""
+    h = requisicao(o["url"], cabecalhos={"User-Agent": NAVEGADOR, "Accept": "text/html"}, texto=True)
+    fim = re.search(r'"endTime":"?(\d{12,})', h)
+    if fim and not o["incluso"]:
+        o["expira"] = datetime.fromtimestamp(int(fim.group(1)) / 1000, timezone.utc).isoformat()
+    nota = re.search(r'"averageRating":([\d.]+),"totalRatingsCount":(\d+)', h)
+    if nota:
+        o["estrelas"] = (float(nota.group(1)), int(nota.group(2)))
+    longa = re.search(r'"type":"LONG"(?:,"subType":"[^"]*")?,"value":"((?:[^"\\]|\\.)*)"', h)
+    curta = re.search(r'"type":"SHORT"(?:,"subType":"[^"]*")?,"value":"((?:[^"\\]|\\.)*)"', h)
+    bruto = (longa or curta)
+    if bruto:
+        try:
+            texto = json.loads(f'"{bruto.group(1)}"')
+        except ValueError:
+            texto = bruto.group(1)
+        # A primeira linha costuma ser um slogan em maiúsculas; pulamos se houver mais texto depois.
+        partes = [t for t in re.split(r"<br\s*/?>", texto) if t.strip()]
+        if len(partes) > 1 and partes[0].isupper():
+            partes = partes[1:]
+        o["resumo"] = " ".join(partes)
+
+
+# ---------------------------------------------------------------------------
+# Xbox Store (API interna do xbox.com; não é oficial e pode mudar)
+# ---------------------------------------------------------------------------
+
+def converter_item_xbox(p):
+    compras = ((p.get("specificPrices") or {}).get("purchaseable")) or []
+    if not compras:
+        return None
+    c = compras[0]
+    atual, regular = c.get("listPrice"), c.get("msrp")
+    if atual is None or not regular:
+        return None
+    desconto = int(round(c.get("discountPercentage") or (1 - atual / regular) * 100))
+    gratis = atual == 0 and regular > 0
+    if not (gratis or desconto >= DESCONTO_MINIMO_CONSOLE):
+        return None
+    nota, qtd = p.get("averageRating"), p.get("ratingCount") or 0
+    if not gratis and (nota is None or nota < XBOX_NOTA_MINIMA or qtd < XBOX_MIN_AVALIACOES):
+        return None
+
+    expira = None
+    if c.get("endDateUtc"):
+        try:
+            expira = datetime.strptime(c["endDateUtc"], "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            pass
+    imagens = p.get("images") or {}
+    imagem = next(((imagens.get(k) or {}).get("url") for k in ("superHeroArt", "titledHeroArt", "poster", "boxArt")
+                   if (imagens.get(k) or {}).get("url")), None)
+    nomes = {"XboxSeriesX": "Xbox Series X|S", "XboxOne": "Xbox One", "PC": "PC"}
+    return {
+        "titulo": p.get("title") or "?",
+        "loja": "Xbox Store",
+        "plataformas": [nomes.get(x, x) for x in p.get("availableOn") or []],
+        "preco": atual,
+        "preco_int": int(round(atual * 100)),
+        "regular": regular,
+        "moeda": c.get("currency") or "BRL",
+        "desconto": desconto,
+        "gratis": gratis,
+        "incluso": False,
+        "menor_hist": False,
+        "no_game_pass": bool(p.get("includedWithPassesProductIds")),
+        "expira": expira,
+        "inicio": None,
+        "url": f"https://www.xbox.com/pt-BR/games/store/jogo/{p.get('productId')}",
+        "id_jogo": "xbox:" + (p.get("productId") or normalizar_titulo(p.get("title"))),
+        "imagem": imagem,
+        "resumo": p.get("shortDescription") or p.get("description"),
+        "estrelas": (nota, qtd) if nota is not None else None,
+    }
+
+
+def buscar_xbox():
+    ofertas, ct = [], None
+    for pagina in range(XBOX_MAX_PAGINAS):
+        corpo = {"Filters": "e30=", "ReturnFilters": False, "ChannelKeyToBeUsedInResponse": "OFERTAS",
+                 "EncodedCT": ct, "ChannelId": "DynamicChannel.GameDeals"}
+        dados = requisicao(XBOX_BROWSE, metodo="POST", corpo=corpo, cabecalhos={
+            "x-ms-api-version": "1.1", "MS-CV": f"alertaPromocoes.{pagina + 1}", "User-Agent": NAVEGADOR})
+        ofertas += [o for o in map(converter_item_xbox, dados.get("productSummaries") or []) if o]
+        ct = ((dados.get("channels") or {}).get("OFERTAS") or {}).get("encodedCT")
+        if not ct or not dados.get("productSummaries"):
+            break
+        time.sleep(0.3)
+    print(f"[info] Xbox: {len(ofertas)} ofertas bem avaliadas ({pagina + 1} página(s) lidas).")
+    return ofertas
+
+
+# ---------------------------------------------------------------------------
 # Detalhes do jogo (resumo, foto, avaliação) para as mensagens com foto
 # ---------------------------------------------------------------------------
 
@@ -330,7 +537,12 @@ def limpar_texto(texto, limite=TAMANHO_RESUMO):
 
 def enriquecer(o, chave_itad):
     """Completa a oferta com resumo, foto e avaliação. Qualquer falha aqui é ignorada."""
-    if o.get("id_itad"):
+    if o.get("id_ps"):
+        try:
+            enriquecer_ps(o)
+        except (RuntimeError, ValueError, TypeError, AttributeError) as e:
+            print(f"[aviso] sem detalhes da PS Store para '{o['titulo']}': {e}")
+    elif o.get("id_itad"):
         try:
             info = requisicao(f"{ITAD_BASE}/games/info/v2?" + urllib.parse.urlencode({"id": o["id_itad"]}),
                               cabecalhos={"ITAD-API-Key": chave_itad})
@@ -367,6 +579,8 @@ def chave_oferta(o):
     - Grátis: por loja + título (pega o mesmo jogo vindo do ITAD e da Epic).
     - Paga: por jogo + loja + preço. Se o preço cair de novo, é outra chave -> novo aviso.
     """
+    if o.get("incluso"):
+        return f"incluso|{o['id_jogo']}"
     if o["gratis"]:
         return f"gratis|{normalizar_titulo(o['loja'])}|{normalizar_titulo(o['titulo'])}"
     return f"{o['id_jogo']}|{normalizar_titulo(o['loja'])}|{o['preco_int']}"
@@ -487,7 +701,9 @@ def tempo_restante(texto_iso, agora=None):
 
 
 def montar_legenda(o):
-    if o["gratis"]:
+    if o.get("incluso"):
+        selo = f"✨ <b>NOVO NO SEU PS PLUS {PS_ASSINATURA.upper()}</b>"
+    elif o["gratis"]:
         selo = "🎁 <b>GRÁTIS PARA RESGATAR</b>"
     elif o["menor_hist"]:
         selo = "🏆 <b>MENOR PREÇO DA HISTÓRIA</b>"
@@ -496,12 +712,17 @@ def montar_legenda(o):
 
     # Bloco 1: identificação
     linhas = [selo, SEPARADOR, f"🎮 <b>{html.escape(o['titulo'])}</b>"]
+    if o.get("plataformas"):
+        linhas.append("🕹 " + html.escape(" · ".join(o["plataformas"])))
     if o.get("tags"):
         linhas.append("🏷 <i>" + html.escape(" · ".join(o["tags"])) + "</i>")
 
     # Bloco 2: preço
     linhas.append("")
-    if o["gratis"]:
+    if o.get("incluso"):
+        linhas.append(f"💰 <b>Já incluso na sua assinatura</b>   <s>{formatar_preco(o['regular'], o['moeda'])}</s>")
+        linhas.append("📥 É só baixar, sem pagar nada a mais")
+    elif o["gratis"]:
         preco = "💰 <b>R$ 0,00</b>"
         if o.get("regular"):
             preco += f"   <s>{formatar_preco(o['regular'], o['moeda'])}</s>"
@@ -512,16 +733,26 @@ def montar_legenda(o):
         if o.get("regular"):
             economia = o["regular"] - o["preco"]
             linhas.append(f"📉 <b>−{o['desconto']}%</b> · economia de <b>{formatar_preco(economia, o['moeda'])}</b>")
+        if o.get("so_assinante"):
+            linhas.append(f"💎 Preço exclusivo para assinantes PS Plus (você tem o {html.escape(PS_ASSINATURA)})")
+        if o.get("extra_plus"):
+            linhas.append(f"➕ Com seu PS Plus: <b>mais {o['extra_plus']}% de desconto</b> no carrinho")
+        if o.get("no_game_pass"):
+            linhas.append("ℹ️ Também está no Game Pass")
 
     # Bloco 3: período da promoção
     linhas.append("")
     inicio, fim = data_curta(o.get("inicio")), data_curta(o.get("expira"))
-    if inicio and fim:
+    if o.get("incluso"):
+        pass  # catálogo de assinatura não tem "promoção"
+    elif inicio and fim:
         linhas.append(f"📅 <b>Promoção:</b> {inicio} → {fim}")
     elif fim:
         linhas.append(f"📅 <b>Promoção até:</b> {fim}")
     elif inicio:
         linhas.append(f"📅 <b>Promoção desde:</b> {inicio} (sem data de fim divulgada)")
+    else:
+        linhas.append("📅 <b>Promoção:</b> sem data de fim divulgada pela loja")
     restante = tempo_restante(o.get("expira"))
     if restante:
         linhas.append(restante)
@@ -532,6 +763,10 @@ def montar_legenda(o):
         n = o.get("n_avaliacoes")
         qtd = f" ({n:,})".replace(",", ".") if n else ""
         detalhes.append(f"⭐ {o['nota']}% positivas{qtd}")
+    elif o.get("estrelas"):
+        media, n = o["estrelas"]
+        qtd = f" ({n:,})".replace(",", ".") if n else ""
+        detalhes.append(f"⭐ {media:.1f}/5{qtd}".replace(".", ",", 1))
     linhas.append(" · ".join(detalhes))
 
     texto = "\n".join(linhas)
@@ -550,7 +785,9 @@ def formatar_linha(o):
     titulo = html.escape(o["titulo"])
     loja = html.escape(o["loja"])
     link = html.escape(o["url"], quote=True)
-    if o["gratis"]:
+    if o.get("incluso"):
+        linha = f'• <a href="{link}">{titulo}</a> — <b>NO SEU PS PLUS</b>'
+    elif o["gratis"]:
         linha = f'• <a href="{link}">{titulo}</a> — <b>GRÁTIS</b> ({loja})'
     else:
         linha = (f'• <a href="{link}">{titulo}</a> — <b>{formatar_preco(o["preco"], o["moeda"])}</b>'
@@ -578,8 +815,8 @@ def montar_lista_compacta(ofertas):
 
 
 def prioridade(o):
-    """Ordem de importância: grátis, menor histórico, maior desconto, mais bem avaliado."""
-    return (not o["gratis"], not o["menor_hist"], -o["desconto"], o["titulo"].lower())
+    """Ordem de importância: grátis, novo no PS Plus, menor histórico, maior desconto."""
+    return (not o["gratis"], not o.get("incluso"), not o["menor_hist"], -o["desconto"], o["titulo"].lower())
 
 
 def enviar_ofertas(token, chat_id, ofertas, chave_itad):
@@ -628,6 +865,18 @@ def coletar_ofertas(chave_itad):
     except (RuntimeError, ValueError, KeyError, TypeError) as e:
         falhas.append(f"Epic grátis: {e}")
 
+    # Consoles: cada loja isolada, para a falha de uma não derrubar as outras.
+    if INCLUIR_PLAYSTATION:
+        try:
+            ofertas += buscar_playstation()
+        except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
+            falhas.append(f"PlayStation Store: {e}")
+    if INCLUIR_XBOX:
+        try:
+            ofertas += buscar_xbox()
+        except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
+            falhas.append(f"Xbox Store: {e}")
+
     return ofertas, falhas
 
 
@@ -665,8 +914,12 @@ def main():
     print(f"[info] {len(unicas)} ofertas válidas, {len(novas)} novas.")
 
     if MODO_EXEMPLO:
-        # Só para ver como as mensagens ficam: manda 3 ofertas atuais, sem mexer no estado.
-        exemplos = sorted(unicas.values(), key=prioridade)[:3]
+        # Só para ver como as mensagens ficam: a melhor oferta atual de cada loja, sem mexer no estado.
+        exemplos, lojas_vistas = [], set()
+        for o in sorted(unicas.values(), key=prioridade):
+            if o["loja"] not in lojas_vistas:
+                lojas_vistas.add(o["loja"])
+                exemplos.append(o)
         enviar_mensagens(token, chat_id, ["👀 <b>Exemplo de como os alertas vão chegar:</b>"])
         for o in exemplos:
             time.sleep(1.2)
