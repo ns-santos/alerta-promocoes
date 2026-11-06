@@ -69,7 +69,7 @@ LIMITE_LEGENDA_FOTO = 1024   # limite do Telegram para legenda de foto
 TAMANHO_RESUMO = 280
 USER_AGENT = "alerta-promocoes-bot/1.1"
 FUSO_BR = timezone(timedelta(hours=-3))
-VERSAO_ESTADO = 3            # mude quando os critérios de busca mudarem
+VERSAO_ESTADO = 4            # mude quando os critérios de busca mudarem
 
 PS_GRAPHQL = "https://web.np.playstation.com/api/graphql/v1/op"
 PS_CATEGORIA_PS5 = "4cbf39e2-5749-4970-ba81-93a489e4570c"   # "Todos os jogos de PS5" (inclui PS4 compatíveis)
@@ -415,7 +415,9 @@ def buscar_playstation():
         url = (f"{PS_GRAPHQL}?operationName=categoryGridRetrieve"
                f"&variables={urllib.parse.quote(json.dumps(variaveis))}"
                f"&extensions={urllib.parse.quote(json.dumps(extensoes))}")
-        dados = requisicao(url, cabecalhos={"x-psn-store-locale-override": "pt-BR", "User-Agent": NAVEGADOR})
+        # O content-type é obrigatório: sem ele a API recusa a consulta como possível CSRF.
+        dados = requisicao(url, cabecalhos={"x-psn-store-locale-override": "pt-BR", "User-Agent": NAVEGADOR,
+                                            "content-type": "application/json"})
         if dados.get("errors"):
             raise RuntimeError(f"PS Store recusou a consulta: {str(dados['errors'])[:200]}")
         grade = (dados.get("data") or {}).get("categoryGridRetrieve") or {}
