@@ -77,7 +77,8 @@ PS_HASH_GRADE = "9845afc0dbaab4965f6563fffc703f588c8e76792000e8610843b8d3ee9c4c0
 XBOX_BROWSE = "https://emerald.xboxservices.com/xboxcomfd/browse?locale=pt-BR"
 NAVEGADOR = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/141.0 Safari/537.36")
-# Texto que a PS Store mostra quando o jogo está no catálogo de um plano do PS Plus.
+# Nível de cada plano do PS Plus. Na PS Store, o selo "Extra" indica jogo completo no catálogo
+# (PS_PLUS_GAME_CATALOG), mas o selo "Deluxe" indica só um TESTE gratuito (PS_PLUS_TRIAL).
 PLANOS_PS = {"essential": 1, "extra": 2, "deluxe": 3, "premium": 3}
 
 
@@ -355,12 +356,20 @@ def preco_brl(texto):
 
 
 def incluso_no_plano(upsell):
-    """'Extra'/'Deluxe'/'Incluído' -> o jogo faz parte do catálogo do PS Plus que a pessoa assina?"""
+    """O jogo completo faz parte do catálogo do PS Plus que a pessoa assina?
+    'Incluído' -> sim; 'Extra' -> sim para Extra e Deluxe; 'Deluxe' -> NÃO (é só teste gratuito)."""
     texto = (upsell or "").strip().lower()
     if texto in ("incluído", "incluido", "included"):
         return True
-    nivel = PLANOS_PS.get(texto)
-    return nivel is not None and nivel <= PLANOS_PS.get(PS_ASSINATURA.lower(), 3)
+    if texto == "extra":
+        return PLANOS_PS.get(PS_ASSINATURA.lower(), 3) >= PLANOS_PS["extra"]
+    return False
+
+
+def tem_teste_gratis(upsell):
+    """Selo 'Deluxe'/'Premium' na lista = teste gratuito do jogo para assinantes desse plano."""
+    texto = (upsell or "").strip().lower()
+    return texto in ("deluxe", "premium") and PLANOS_PS.get(PS_ASSINATURA.lower(), 3) >= PLANOS_PS["deluxe"]
 
 
 def converter_item_ps(p):
@@ -395,6 +404,7 @@ def converter_item_ps(p):
         "incluso": incluso,
         "menor_hist": False,
         "so_assinante": bool(preco.get("isTiedToSubscription")),
+        "teste_gratis": tem_teste_gratis(upsell),
         "extra_plus": int(extra_plus.group(1)) if extra_plus else None,
         "expira": None,
         "inicio": None,
@@ -739,6 +749,8 @@ def montar_legenda(o):
             linhas.append(f"💎 Preço exclusivo para assinantes PS Plus (você tem o {html.escape(PS_ASSINATURA)})")
         if o.get("extra_plus"):
             linhas.append(f"➕ Com seu PS Plus: <b>mais {o['extra_plus']}% de desconto</b> no carrinho")
+        if o.get("teste_gratis"):
+            linhas.append(f"🧪 Você pode testar de graça antes com o seu PS Plus {html.escape(PS_ASSINATURA)}")
         if o.get("no_game_pass"):
             linhas.append("ℹ️ Também está no Game Pass")
 
